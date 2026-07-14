@@ -66,6 +66,6 @@ class LeggingCostCalculator:
             
         else:
             # Unknown trade side
-            return 0.0
+            return None
 
         return float(cost_usd)
