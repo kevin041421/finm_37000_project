@@ -1,15 +1,14 @@
-"""MarketDataFetcher: interface + data contracts for calendar-spread market data (Issue #6/#7).
+"""MarketDataFetcher: interface + data contracts for calendar-spread market data (Issues #6/#7).
 
 This module defines the *schema* that downstream modules (legging cost #8,
-expected P&L engine #9, lead-lag analysis #11) can build against, plus a
-skeleton ``MarketDataFetcher`` class.
+expected P&L engine #9, lead-lag analysis #11) can build against, plus the
+``MarketDataFetcher`` class.
 
-Issue #6 (this pass) implements the actual Databento fetching + trading-day
-chunking: ``_fetch_single_instrument``, ``_fetch_single_instrument_trades``,
-``_trading_days``. Issue #7's methods (``next_contract_month``,
-``_fetch_definitions``, ``_build_contract_spec``) remain ``NotImplementedError``
-here — they depend on the contract mapping file (product_specs.json) landing
-separately, and are out of scope for this change.
+Both Issue #6 (Databento fetching + trading-day chunking:
+``_fetch_single_instrument``, ``_fetch_single_instrument_trades``,
+``_trading_days``) and Issue #7 (``next_contract_month``,
+``_fetch_definitions``, ``_build_contract_spec``, backed by the contract
+mapping file — product_specs.py / product_specs.json) are implemented.
 
 Data contracts
 --------------
@@ -46,9 +45,13 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from decimal import Decimal
+from pathlib import Path
 from typing import TYPE_CHECKING, Iterator, Optional, Union
 
 import pandas as pd
+
+import product_specs
 
 if TYPE_CHECKING:  # avoid a hard databento dependency at import time
     import databento as db
@@ -135,22 +138,29 @@ def next_contract_month(front_month: str, cycle: str = QUARTERLY_CYCLE) -> str:
             is not in ``cycle`` — so calling with a monthly product's contract
             (e.g. ``"F6"``) under the default fails loudly instead of
             silently picking a wrong back month.
-
-    Must handle year rollover: the contract after Z6 is H7 (quarterly) or F7
-    (monthly). Must raise ``ValueError`` for a month code not in ``cycle``.
-
-    Expected behavior once implemented::
-
-        next_contract_month("M6")                 -> "U6"
-        next_contract_month("Z6")                 -> "H7"
-        next_contract_month("F6", cycle=MONTH_CODES) -> "G6"
-
-    TODO(#7): the cycle should not be caller-supplied — look it up per
-    product from the contract mapping file (e.g. ``"ES": "HMUZ"``,
-    ``"CL": MONTH_CODES``) so the fetcher identifies the right back month
-    from the product code alone.
     """
-    raise NotImplementedError  # Issue #7
+    if len(front_month) != 2:
+        raise ValueError(
+            f"front_month must be a month code plus a single year digit, "
+            f"e.g. 'M6' — got {front_month!r}"
+        )
+    month_code, year_digit = front_month[0], front_month[1]
+    if month_code not in cycle:
+        raise ValueError(
+            f"Month code {month_code!r} (from front_month={front_month!r}) "
+            f"is not in cycle {cycle!r}"
+        )
+    if not year_digit.isdigit():
+        raise ValueError(
+            f"front_month's second character must be a digit — got {front_month!r}"
+        )
+
+    idx = cycle.index(month_code)
+    year = int(year_digit)
+    if idx + 1 < len(cycle):
+        return f"{cycle[idx + 1]}{year}"
+    # wrap to the first month of the cycle, next year
+    return f"{cycle[0]}{(year + 1) % 10}"
 
 
 def split_symbol(symbol: str) -> tuple[str, str, str]:
@@ -198,22 +208,22 @@ class CalendarSpreadContractSpec:
     front_symbol: str            # e.g. "ESM6"
     back_symbol: str             # e.g. "ESU6"
     spread_symbol: str           # e.g. "ESM6-ESU6"
-    outright_tick_size: float    # points, e.g. 0.25
-    spread_tick_size: float      # points, e.g. 0.05
-    contract_multiplier: float   # $ per point, e.g. 50.0
-    quote_scaling: float = 1.0   # raw-quote -> point conversion (e.g. cents quotes)
+    outright_tick_size: Decimal  # points, e.g. Decimal("0.25")
+    spread_tick_size: Decimal    # points, e.g. Decimal("0.05")
+    contract_multiplier: Decimal  # $ per point, e.g. Decimal("50")
+    quote_scaling: Decimal = Decimal("1")  # raw-quote -> point conversion
     price_display_format: str = "decimal"  # "decimal" | "fractional"
     fractional_denominator: Optional[int] = None  # e.g. 32 for ZN, if fractional
     front_expiration: Optional[pd.Timestamp] = None
     back_expiration: Optional[pd.Timestamp] = None
 
     @property
-    def outright_tick_value(self) -> float:
+    def outright_tick_value(self) -> Decimal:
         """Dollar value of one outright tick."""
         return self.outright_tick_size * self.contract_multiplier
 
     @property
-    def spread_tick_value(self) -> float:
+    def spread_tick_value(self) -> Decimal:
         """Dollar value of one spread tick."""
         return self.spread_tick_size * self.contract_multiplier
 
@@ -228,13 +238,12 @@ class MarketDataFetcher:
         — generator yielding one day at a time; use for long windows.
       - ``fetch_calendar_spread_contract_specification(front_month, product)``
 
-    The private fetch/definition methods are the implementation surface
-    for Issues #6/#7. As of this change, the #6 methods
-    (``_fetch_single_instrument``, ``_fetch_single_instrument_trades``,
-    ``_trading_days``) are implemented; the #7 methods
-    (``_fetch_definitions``, ``_build_contract_spec``) and
-    ``next_contract_month`` still raise ``NotImplementedError`` pending the
-    contract mapping file.
+    The private fetch/definition methods were the implementation surface
+    for Issues #6/#7; both are now implemented:
+    ``_fetch_single_instrument``, ``_fetch_single_instrument_trades``,
+    ``_trading_days`` (#6), and ``_fetch_definitions``,
+    ``_build_contract_spec``, ``next_contract_month`` (#7, backed by
+    product_specs.py / product_specs.json).
     """
 
     def __init__(
@@ -242,6 +251,7 @@ class MarketDataFetcher:
         client: Optional["db.Historical"] = None,
         dataset: str = CME_DATASET,
         levels: int = 1,
+        product_specs_path: Optional[Path] = None,
     ) -> None:
         """``levels`` defaults to 1 (MBP-1, top of book): sufficient for the
         P&L simulation (#9) and far cheaper to fetch and hold in memory than
@@ -251,11 +261,50 @@ class MarketDataFetcher:
         Raises ``ValueError`` immediately if ``levels`` isn't a depth
         Databento actually supports (1 or 10) — fail at construction, not
         on the first fetch call.
+
+        ``product_specs_path`` overrides where product_specs.json is read
+        from (defaults to product_specs.DEFAULT_SPECS_PATH, i.e. co-located
+        with product_specs.py). The file itself is loaded lazily on first
+        use (not here in __init__) and cached — so constructing a fetcher
+        for tests or for methods that don't need contract specs works fine
+        even without product_specs.json present.
         """
         _schema_for_levels(levels)  # validates; raises early if invalid
         self._client = client
         self._dataset = dataset
         self._levels = levels
+        self._product_specs_path = product_specs_path or product_specs.DEFAULT_SPECS_PATH
+        self._product_specs_cache: Optional[dict] = None
+
+    def _specs(self) -> dict:
+        """Lazily load + cache product_specs.json. Not called from
+        __init__ so that constructing a MarketDataFetcher never requires
+        the file to exist unless a method that actually needs it is called."""
+        if self._product_specs_cache is None:
+            self._product_specs_cache = product_specs.load_product_specs(self._product_specs_path)
+        return self._product_specs_cache
+
+    @classmethod
+    def from_databento_key(
+        cls,
+        dataset: str = CME_DATASET,
+        levels: int = 1,
+        product_specs_path: Optional[Path] = None,
+        api_key_path: Optional[Path] = None,
+    ) -> "MarketDataFetcher":
+        """Construct a MarketDataFetcher with a real Databento client,
+        reading the API key via util.get_databento_api_key() (defaults to
+        ~/.databento_api_key) instead of requiring the caller to import
+        databento and util themselves. util.py lives in src/, alongside
+        this module, so the plain `from util import ...` import below
+        resolves as a sibling-module import.
+        """
+        import databento as db_module
+        from util import get_databento_api_key
+
+        api_key = get_databento_api_key(api_key_path)
+        client = db_module.Historical(api_key)
+        return cls(client=client, dataset=dataset, levels=levels, product_specs_path=product_specs_path)
 
     # ------------------------------------------------------------------ #
     # Public API
@@ -267,7 +316,7 @@ class MarketDataFetcher:
         product: str,
         time_start: TimeLike,
         time_end: TimeLike,
-        cycle: str = QUARTERLY_CYCLE,
+        cycle: Optional[str] = None,
     ) -> CalendarSpreadData:
         """Fetch raw books and trades for the front month, back month, and spread.
 
@@ -275,21 +324,17 @@ class MarketDataFetcher:
             front_month: Month-year code of the front leg, e.g. ``"M6"``.
             product: CME product code, e.g. ``"ES"``.
             time_start / time_end: Requested time window.
-            cycle: Listed contract cycle used to derive the back month
-                (default quarterly ``"HMUZ"``; use ``MONTH_CODES`` for
-                monthly products like CL).
+            cycle: Listed contract cycle used to derive the back month.
+                Defaults to a product_specs.json lookup for ``product``
+                (raises if the product isn't tracked there); pass
+                explicitly (e.g. ``MONTH_CODES``) to override or to use a
+                product not yet onboarded into product_specs.json.
 
         The back month is the next contract in ``cycle`` after
         ``front_month``. Each instrument's books and trades are fetched
         separately and returned on their raw event timestamps — no
         cross-instrument alignment is performed (consumers use as-of
         lookups where needed, e.g. book state at a trade's timestamp).
-
-        NOTE: still raises NotImplementedError via ``_resolve_symbols`` ->
-        ``next_contract_month``, which is Issue #7 scope (depends on the
-        contract mapping file). The #6 fetch methods this calls into
-        (``_fetch_single_instrument`` etc.) are implemented and independently
-        testable with an already-resolved symbol in the meantime.
         """
         front_symbol, back_symbol, spread_symbol = self._resolve_symbols(
             front_month, product, cycle
@@ -321,7 +366,7 @@ class MarketDataFetcher:
         product: str,
         time_start: TimeLike,
         time_end: TimeLike,
-        cycle: str = QUARTERLY_CYCLE,
+        cycle: Optional[str] = None,
     ) -> Iterator[CalendarSpreadData]:
         """Lazily yield one ``CalendarSpreadData`` per trading day in the window.
 
@@ -339,7 +384,7 @@ class MarketDataFetcher:
         self,
         front_month: str,
         product: str,
-        cycle: str = QUARTERLY_CYCLE,
+        cycle: Optional[str] = None,
     ) -> CalendarSpreadContractSpec:
         """Fetch the static contract parameters for the legs and their spread."""
         front_symbol, back_symbol, spread_symbol = self._resolve_symbols(
@@ -358,13 +403,24 @@ class MarketDataFetcher:
         self,
         front_month: str,
         product: str,
-        cycle: str = QUARTERLY_CYCLE,
+        cycle: Optional[str] = None,
     ) -> tuple[str, str, str]:
         """Resolve (front, back, spread) symbols from a front month and product.
+
+        ``cycle`` defaults to a product_specs.json lookup (see
+        product_specs.get_product_spec) rather than a hardcoded quarterly
+        default
+        next_contract_month: a product not yet in product_specs.json raises
+        ProductSpecError here rather than silently guessing quarterly and
+        potentially computing a wrong back month for a monthly product.
+        Pass ``cycle`` explicitly to bypass the lookup entirely (e.g. for a
+        product not yet onboarded into product_specs.json).
 
         >>> MarketDataFetcher()._resolve_symbols("M6", "ES")
         ('ESM6', 'ESU6', 'ESM6-ESU6')
         """
+        if cycle is None:
+            cycle = product_specs.get_product_spec(product, specs=self._specs()).listing_cycle
         back_month = next_contract_month(front_month, cycle)
         front_symbol = f"{product}{front_month}"
         back_symbol = f"{product}{back_month}"
@@ -501,7 +557,22 @@ class MarketDataFetcher:
         spread_symbol: str,
     ) -> pd.DataFrame:
         """Fetch Databento instrument definitions for the legs and the spread."""
-        raise NotImplementedError  # Issue #7
+        start = (
+            pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=_DEFINITION_LOOKBACK_DAYS)
+        ).isoformat()
+        dbn = self._client.timeseries.get_range(
+            dataset=self._dataset,
+            schema="definition",
+            symbols=[symbol1, symbol2, spread_symbol],
+            start=start,
+        )
+        df = dbn.to_df()
+        if df.empty:
+            raise ValueError(
+                f"No definition data returned for {[symbol1, symbol2, spread_symbol]} "
+                f"in the last {_DEFINITION_LOOKBACK_DAYS} days"
+            )
+        return df
 
     def _build_contract_spec(
         self,
@@ -510,8 +581,91 @@ class MarketDataFetcher:
         spread_symbol: str,
         definitions: pd.DataFrame,
     ) -> CalendarSpreadContractSpec:
-        """Map raw definitions (+ static JSON mapping file) to a ``CalendarSpreadContractSpec``."""
-        raise NotImplementedError  # Issue #7
+        """Map raw definitions (+ static JSON mapping file) to a ``CalendarSpreadContractSpec``.
+
+        Static fields (tick sizes, multiplier, price format) come from
+        product_specs.json via ``product_specs.get_product_spec`` — see
+        that module's docstring. Expirations are computed from the
+        product's termination_rule, then cross-checked against
+        ``definitions``'s own ``expiration`` column where available; a
+        mismatch raises rather than silently trusting the computed rule
+        (see product_specs.py CAUTION #1 on why the computed date isn't
+        fully trusted on its own).
+        """
+        product_code, front_month_code, front_year_digit = split_symbol(symbol1)
+        _, back_month_code, back_year_digit = split_symbol(symbol2)
+
+        spec = product_specs.get_product_spec(product_code, specs=self._specs())
+
+        now = pd.Timestamp.now(tz="UTC")
+        front_year = _full_year(front_year_digit, reference=now)
+        back_year = _full_year(back_year_digit, reference=now)
+
+        front_expiration = product_specs.compute_termination_date(spec, front_month_code, front_year)
+        back_expiration = product_specs.compute_termination_date(spec, back_month_code, back_year)
+
+        self._validate_expiration(definitions, symbol1, front_expiration)
+        self._validate_expiration(definitions, symbol2, back_expiration)
+
+        return CalendarSpreadContractSpec(
+            product_code=product_code,
+            front_symbol=symbol1,
+            back_symbol=symbol2,
+            spread_symbol=spread_symbol,
+            outright_tick_size=spec.outright_tick_size,
+            spread_tick_size=spec.spread_tick_size,
+            contract_multiplier=spec.contract_multiplier,
+            quote_scaling=spec.quote_scaling,
+            price_display_format=spec.price_display_format,
+            fractional_denominator=spec.fractional_denominator,
+            front_expiration=front_expiration,
+            back_expiration=back_expiration,
+        )
+
+    @staticmethod
+    def _validate_expiration(
+        definitions: pd.DataFrame,
+        symbol: str,
+        computed_expiration: pd.Timestamp,
+        tolerance_days: int = 1,
+    ) -> None:
+        """Cross-check a rule-computed expiration against Databento's own
+        reported expiration for `symbol`, if present in `definitions`.
+        Raises ValueError on a mismatch beyond `tolerance_days` — the
+        1-day default tolerance absorbs the no-holiday-calendar imprecision
+        flagged in product_specs.py's CAUTION #1, not a sign the check is
+        loose; a mismatch beyond that means the encoded rule itself is
+        probably wrong and needs a human to re-check it against CME's spec
+        sheet, not that this check should be widened further.
+
+        Silently does nothing if `definitions` has no row for `symbol` or
+        no `expiration` column — this validation is a backstop, not a hard
+        requirement, since not every Databento definition schema version is
+        guaranteed to expose it.
+        """
+        if "raw_symbol" not in definitions.columns or "expiration" not in definitions.columns:
+            return
+        rows = definitions[definitions["raw_symbol"] == symbol]
+        if rows.empty:
+            return
+        reported = pd.Timestamp(rows.iloc[-1]["expiration"])
+        if reported.tzinfo is None:
+            reported = reported.tz_localize("UTC")
+        else:
+            reported = reported.tz_convert("UTC")
+        computed = computed_expiration
+        if computed.tzinfo is None:
+            computed = computed.tz_localize("UTC")
+
+        if abs((reported.normalize() - computed.normalize()).days) > tolerance_days:
+            raise ValueError(
+                f"{symbol}: computed expiration {computed.date()} from the "
+                f"product's termination_rule differs from Databento's "
+                f"reported expiration {reported.date()} by more than "
+                f"{tolerance_days} day(s). The encoded termination_rule for "
+                f"this product is likely wrong — verify against CME's "
+                f"product spec sheet."
+            )
 
 
 def _ensure_utc_index(index: pd.DatetimeIndex) -> pd.DatetimeIndex:
@@ -520,3 +674,31 @@ def _ensure_utc_index(index: pd.DatetimeIndex) -> pd.DatetimeIndex:
     if index.tz is None:
         return index.tz_localize("UTC")
     return index.tz_convert("UTC")
+
+
+#: How far back to search for an instrument's definition record. Definitions
+#: don't change over a contract's life, so this just needs to comfortably
+#: span "however long ago the contract could have been listed."
+_DEFINITION_LOOKBACK_DAYS = 400
+
+
+def _full_year(year_digit: str, reference: Optional[pd.Timestamp] = None) -> int:
+    """Resolve a single CME year digit (e.g. '6') to a full year, assuming
+    the nearest calendar year to `reference` (default: now) whose last
+    digit matches.
+
+    CAUTION: single-digit year symbols are only unambiguous within roughly
+    a 5-year window — 'M6' means June 2026 today but will mean June 2036 in
+    2031. This picks whichever full year is closest to `reference`; for a
+    far-dated or historical contract outside that window, it will silently
+    pick the wrong decade. This ambiguity isn't specific to this function —
+    every symbol-year usage in this codebase (project_fetch_data.py, the
+    test suite) shares it — but it matters most here, since a wrong year
+    feeds directly into compute_termination_date with no other check to
+    catch it before _validate_expiration compares against Databento (which
+    would catch a wrong year as a large mismatch, but only after the fact).
+    """
+    reference = reference or pd.Timestamp.now(tz="UTC")
+    digit = int(year_digit)
+    candidates = [(reference.year // 10) * 10 + digit + offset * 10 for offset in (-1, 0, 1)]
+    return min(candidates, key=lambda y: abs(y - reference.year))

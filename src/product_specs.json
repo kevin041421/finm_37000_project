@@ -1,0 +1,62 @@
+{
+  "ES": {
+    "asset_class": "equity",
+    "outright_tick_size": "0.25",
+    "spread_tick_size": "0.05",
+    "contract_multiplier": "50",
+    "quote_scaling": "1",
+    "price_display_format": "decimal",
+    "fractional_denominator": null,
+    "listing_cycle": ["H", "M", "U", "Z"],
+    "termination_rule": {
+      "type": "nth_weekday_of_month",
+      "weekday": "Friday",
+      "n": 3
+    }
+  },
+  "ZN": {
+    "asset_class": "rates",
+    "outright_tick_size": "0.015625",
+    "spread_tick_size": "0.015625",
+    "contract_multiplier": "1000",
+    "quote_scaling": "1",
+    "price_display_format": "fractional",
+    "fractional_denominator": 32,
+    "listing_cycle": ["H", "M", "U", "Z"],
+    "termination_rule": {
+      "type": "business_days_before_month_end",
+      "days": 7
+    }
+  },
+  "CL": {
+    "asset_class": "energy",
+    "outright_tick_size": "0.01",
+    "spread_tick_size": "0.01",
+    "contract_multiplier": "1000",
+    "quote_scaling": "1",
+    "price_display_format": "decimal",
+    "fractional_denominator": null,
+    "listing_cycle": ["F", "G", "H", "J", "K", "M", "N", "Q", "U", "V", "X", "Z"],
+    "termination_rule": {
+      "type": "business_days_before_day_of_prior_month",
+      "days": 3,
+      "day_of_month": 25
+    }
+  },
+  "6E": {
+    "asset_class": "fx",
+    "outright_tick_size": "0.00005",
+    "spread_tick_size": "0.00005",
+    "contract_multiplier": "125000",
+    "quote_scaling": "1",
+    "price_display_format": "decimal",
+    "fractional_denominator": null,
+    "listing_cycle": ["H", "M", "U", "Z"],
+    "termination_rule": {
+      "type": "nth_weekday_of_month",
+      "weekday": "Wednesday",
+      "n": 3,
+      "offset_business_days": -2
+    }
+  }
+}

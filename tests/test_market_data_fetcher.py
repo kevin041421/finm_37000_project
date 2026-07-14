@@ -1,18 +1,19 @@
-"""Unit tests for MarketDataFetcher (Issue #6 implemented, Issue #7 pending).
+"""Unit tests for MarketDataFetcher (Issues #6 and #7 implemented).
 
 - pure helpers (symbol parsing, spread symbol building, schema, spec math)
   are tested directly;
 - the public methods are tested as *composition* with mocked privates,
   pinning down the call contract independent of implementation;
 - Issue #6's methods (_fetch_single_instrument, _fetch_single_instrument_trades,
-  _trading_days) now have real coverage against a mocked Databento client —
-  see the "Issue #6 — implemented fetch methods" section below;
-- the intended behavior of ``next_contract_month`` (and everything that
-  depends on it: _fetch_definitions, _build_contract_spec) is still written
-  as xfail tests pending Issue #7; remove the marks once implemented.
+  _trading_days) have real coverage against a mocked Databento client;
+- Issue #7's methods (next_contract_month, _fetch_definitions,
+  _build_contract_spec) also have real coverage now — the tests that were
+  previously xfail (pending Issue #7) have had that mark removed per the
+  original file's own instruction to do so once implemented.
 """
 
 import sys
+from decimal import Decimal
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -24,6 +25,7 @@ sys.path.append(str(Path(__file__).resolve().parent.parent / "src"))
 from market_data_fetcher import (
     BOOK_INDEX_NAME,
     MONTH_CODES,
+    QUARTERLY_CYCLE,
     TRADE_COLUMNS,
     CalendarSpreadContractSpec,
     CalendarSpreadData,
@@ -101,9 +103,9 @@ def es_spec():
         front_symbol="ESM6",
         back_symbol="ESU6",
         spread_symbol="ESM6-ESU6",
-        outright_tick_size=0.25,
-        spread_tick_size=0.05,
-        contract_multiplier=50.0,
+        outright_tick_size=Decimal("0.25"),
+        spread_tick_size=Decimal("0.05"),
+        contract_multiplier=Decimal("50"),
     )
 
 
@@ -151,8 +153,10 @@ def test_make_book_conforms_to_schema(es_books):
 
 def test_spec_tick_values(es_spec):
     # ES: one outright tick (0.25 pt) = $12.50, one spread tick (0.05 pt) = $2.50
-    assert es_spec.outright_tick_value == pytest.approx(12.50)
-    assert es_spec.spread_tick_value == pytest.approx(2.50)
+    # Exact equality, not approx — Decimal arithmetic has no float rounding
+    # error to approximate away; that precision is the entire point.
+    assert es_spec.outright_tick_value == Decimal("12.50")
+    assert es_spec.spread_tick_value == Decimal("2.50")
 
 
 def test_make_trades_conforms_to_schema(es_trades):
@@ -192,10 +196,8 @@ def test_split_symbol_rejects_garbage():
         split_symbol("NOT_A_SYMBOL")
 
 
-# Intended behavior of next_contract_month, TDD-style — these become the spec;
-# remove the xfail marks once it is implemented (Issue #7).
+# next_contract_month, implemented (Issue #7).
 
-@pytest.mark.xfail(raises=NotImplementedError, reason="Issue #7: next_contract_month not implemented")
 def test_next_contract_quarterly():
     assert next_contract_month("H6") == "M6"
     assert next_contract_month("M6") == "U6"
@@ -203,13 +205,11 @@ def test_next_contract_quarterly():
     assert next_contract_month("Z6") == "H7"  # year rollover
 
 
-@pytest.mark.xfail(raises=NotImplementedError, reason="Issue #7: next_contract_month not implemented")
 def test_next_contract_monthly_cycle():
     assert next_contract_month("F6", cycle=MONTH_CODES) == "G6"
     assert next_contract_month("Z6", cycle=MONTH_CODES) == "F7"
 
 
-@pytest.mark.xfail(raises=NotImplementedError, reason="Issue #7: next_contract_month not implemented")
 def test_next_contract_rejects_bad_input():
     with pytest.raises(ValueError):
         next_contract_month("A6")  # 'A' not a month code in the quarterly cycle
@@ -217,12 +217,30 @@ def test_next_contract_rejects_bad_input():
         next_contract_month("M")  # missing year digit
 
 
-@pytest.mark.xfail(raises=NotImplementedError, reason="Issue #7: next_contract_month not implemented")
 def test_resolve_symbols(fetcher):
+    # ES: cycle auto-resolved from product_specs.json (quarterly)
     assert fetcher._resolve_symbols("M6", "ES") == ("ESM6", "ESU6", "ESM6-ESU6")
-    assert fetcher._resolve_symbols("Z6", "NQ") == ("NQZ6", "NQH7", "NQZ6-NQH7")
+    # 6E: also auto-resolved from product_specs.json (quarterly)
+    assert fetcher._resolve_symbols("Z6", "6E") == ("6EZ6", "6EH7", "6EZ6-6EH7")
+    # CL: auto-resolved from product_specs.json (monthly) — no explicit
+    # cycle needed anymore; this used to require cycle=MONTH_CODES or it
+    # would silently (and wrongly) default to quarterly.
+    assert fetcher._resolve_symbols("F6", "CL") == ("CLF6", "CLG6", "CLF6-CLG6")
+    # explicit cycle still overrides the product_specs.json lookup
     assert fetcher._resolve_symbols("F6", "CL", cycle=MONTH_CODES) == (
         "CLF6", "CLG6", "CLF6-CLG6"
+    )
+
+
+def test_resolve_symbols_untracked_product_raises(fetcher):
+    # "NQ" has no product_specs.json entry — raises rather than silently
+    # guessing quarterly, unless the caller supplies cycle explicitly.
+    with pytest.raises(Exception):
+        fetcher._resolve_symbols("Z6", "NQ")
+    # explicit cycle bypasses the lookup entirely, so an untracked product
+    # still works if the caller supplies it.
+    assert fetcher._resolve_symbols("Z6", "NQ", cycle=QUARTERLY_CYCLE) == (
+        "NQZ6", "NQH7", "NQZ6-NQH7"
     )
 
 
@@ -290,7 +308,6 @@ def test_fetch_calendar_spread_data_composes_privates(fetcher, es_books, es_trad
     assert result.front_trades["side"].iloc[0] == "A"
 
 
-@pytest.mark.xfail(raises=NotImplementedError, reason="Issue #7: next_contract_month not implemented")
 def test_fetch_calendar_spread_data_validates_before_fetching(fetcher):
     with patch.object(fetcher, "_fetch_single_instrument") as mock_fetch:
         with pytest.raises(ValueError):
@@ -328,9 +345,12 @@ def test_iter_calendar_spread_data_is_lazy_and_yields_per_day(fetcher):
         with pytest.raises(StopIteration):
             next(gen)
 
-    # each day fetched with its own sub-window
-    assert mock_fetch.call_args_list[0].args == ("M6", "ES", *windows[0], "HMUZ")
-    assert mock_fetch.call_args_list[1].args == ("M6", "ES", *windows[1], "HMUZ")
+    # each day fetched with its own sub-window; cycle defaults to None here
+    # (resolution against product_specs.json happens one layer deeper, in
+    # _resolve_symbols, which fetch_calendar_spread_data is mocked out and
+    # never actually calls in this composition test)
+    assert mock_fetch.call_args_list[0].args == ("M6", "ES", *windows[0], None)
+    assert mock_fetch.call_args_list[1].args == ("M6", "ES", *windows[1], None)
 
 
 # --------------------------------------------------------------------- #
@@ -474,13 +494,84 @@ def test_trading_days_raises_on_inverted_range():
 
 
 # --------------------------------------------------------------------- #
-# Remaining not-yet-implemented surface (Issue #7 only, now that #6 is done)
+# Issue #7 — _fetch_definitions and _build_contract_spec
+# (real behavior, mocked Databento client, real product_specs.json)
 # --------------------------------------------------------------------- #
 
-def test_issue_7_privates_still_unimplemented(fetcher):
-    with pytest.raises(NotImplementedError):
-        next_contract_month("M6")
-    with pytest.raises(NotImplementedError):
-        fetcher._fetch_definitions("ESM6", "ESU6", "ESM6-ESU6")
-    with pytest.raises(NotImplementedError):
-        fetcher._build_contract_spec("ESM6", "ESU6", "ESM6-ESU6", pd.DataFrame())
+def _fetcher_with_definitions_client(definitions_df) -> MagicMock:
+    client = MagicMock()
+    result = MagicMock()
+    result.to_df.return_value = definitions_df
+    client.timeseries.get_range.return_value = result
+    return client
+
+
+def test_fetch_definitions_queries_all_three_symbols():
+    defs = pd.DataFrame({"raw_symbol": ["ESM6", "ESU6", "ESM6-ESU6"]})
+    client = _fetcher_with_definitions_client(defs)
+    f = MarketDataFetcher(client=client, levels=1)
+
+    result = f._fetch_definitions("ESM6", "ESU6", "ESM6-ESU6")
+
+    _, kwargs = client.timeseries.get_range.call_args
+    assert kwargs["schema"] == "definition"
+    assert kwargs["symbols"] == ["ESM6", "ESU6", "ESM6-ESU6"]
+    assert len(result) == 3
+
+
+def test_fetch_definitions_raises_on_empty_result():
+    client = _fetcher_with_definitions_client(pd.DataFrame())
+    f = MarketDataFetcher(client=client, levels=1)
+    with pytest.raises(ValueError):
+        f._fetch_definitions("ESM6", "ESU6", "ESM6-ESU6")
+
+
+def test_build_contract_spec_uses_product_specs_json():
+    # ES's real termination_rule (3rd Friday) -> 2026-06-19 for M6, matches
+    # Databento's reported expiration exactly, so no ValueError.
+    defs = pd.DataFrame({
+        "raw_symbol": ["ESM6", "ESU6"],
+        "expiration": [
+            pd.Timestamp("2026-06-19", tz="UTC"),
+            pd.Timestamp("2026-09-18", tz="UTC"),
+        ],
+    })
+    f = MarketDataFetcher(client=MagicMock(), levels=1)
+
+    spec = f._build_contract_spec("ESM6", "ESU6", "ESM6-ESU6", defs)
+
+    assert spec.product_code == "ES"
+    assert spec.outright_tick_size == Decimal("0.25")
+    assert spec.spread_tick_size == Decimal("0.05")
+    assert spec.contract_multiplier == Decimal("50")
+    assert spec.front_expiration.date() == pd.Timestamp("2026-06-19").date()
+
+
+def test_build_contract_spec_raises_on_expiration_mismatch():
+    # Databento reports an expiration far from what ES's termination_rule
+    # would compute — should raise rather than silently trust the rule.
+    defs = pd.DataFrame({
+        "raw_symbol": ["ESM6", "ESU6"],
+        "expiration": [
+            pd.Timestamp("2026-06-01", tz="UTC"),  # nowhere near the 3rd Friday
+            pd.Timestamp("2026-09-18", tz="UTC"),
+        ],
+    })
+    f = MarketDataFetcher(client=MagicMock(), levels=1)
+
+    with pytest.raises(ValueError, match="differs from Databento"):
+        f._build_contract_spec("ESM6", "ESU6", "ESM6-ESU6", defs)
+
+
+def test_build_contract_spec_skips_validation_when_expiration_column_absent():
+    # No "expiration" column at all — validation should no-op, not crash.
+    defs = pd.DataFrame({"raw_symbol": ["ESM6", "ESU6"]})
+    f = MarketDataFetcher(client=MagicMock(), levels=1)
+    spec = f._build_contract_spec("ESM6", "ESU6", "ESM6-ESU6", defs)
+    assert spec.product_code == "ES"
+
+
+def test_build_contract_spec_unknown_product_raises():
+    f = MarketDataFetcher(client=MagicMock(), levels=1)
+    with pytest.raises(Exception):  # ProductSpecError — no JSON entry for "ZZ"
+        f._build_contract_spec("ZZM6", "ZZU6", "ZZM6-ZZU6", pd.DataFrame())
