@@ -2,10 +2,14 @@
 
 This module defines the *schema* that downstream modules (legging cost #8,
 expected P&L engine #9, lead-lag analysis #11) can build against, plus a
-skeleton ``MarketDataFetcher`` class. Fetching logic is intentionally
-not implemented yet — the private methods raise ``NotImplementedError`` and
-the public methods are pure composition, so they can be unit-tested today
-with mocked privates.
+skeleton ``MarketDataFetcher`` class.
+
+Issue #6 (this pass) implements the actual Databento fetching + trading-day
+chunking: ``_fetch_single_instrument``, ``_fetch_single_instrument_trades``,
+``_trading_days``. Issue #7's methods (``next_contract_month``,
+``_fetch_definitions``, ``_build_contract_spec``) remain ``NotImplementedError``
+here — they depend on the contract mapping file (product_specs.json) landing
+separately, and are out of scope for this change.
 
 Data contracts
 --------------
@@ -59,6 +63,12 @@ MONTH_CODES = "FGHJKMNQUVXZ"
 
 _SYMBOL_RE = re.compile(rf"^(?P<root>[A-Z0-9]+?)(?P<month>[{MONTH_CODES}])(?P<year>\d)$")
 
+#: Databento only exposes two MBP book depths — there is no schema for an
+#: arbitrary N in between. A `levels` value outside this set can't be
+#: satisfied by any real Databento schema, so it's validated at construction
+#: time rather than failing later inside a fetch call.
+VALID_BOOK_LEVELS = {1, 10}
+
 
 #: Columns of a trade frame (index: ``ts_event``).
 TRADE_COLUMNS = ["price", "size", "side"]
@@ -75,6 +85,31 @@ def book_columns(levels: int = 10) -> list[str]:
             f"ask_sz_{lvl:02d}",
         ]
     return cols
+
+
+def _normalize_time(value: TimeLike) -> pd.Timestamp:
+    """Coerce a TimeLike (str or Timestamp) into a tz-aware UTC Timestamp.
+
+    Idempotent on an already-aware Timestamp; localizes a naive Timestamp
+    or a bare date/datetime string to UTC rather than guessing a different
+    zone. Centralized here so every call site normalizes identically —
+    the existing project_fetch_data.py script builds its own one-off
+    UTC-aware Timestamp inline; this is the same pattern, shared.
+    """
+    ts = pd.Timestamp(value)
+    if ts.tz is None:
+        return ts.tz_localize("UTC")
+    return ts.tz_convert("UTC")
+
+
+def _schema_for_levels(levels: int) -> str:
+    """Map a book depth to the (only two) real Databento MBP schema names."""
+    if levels not in VALID_BOOK_LEVELS:
+        raise ValueError(
+            f"levels must be one of {sorted(VALID_BOOK_LEVELS)} — Databento "
+            f"only provides mbp-1 and mbp-10 book schemas, got {levels!r}"
+        )
+    return f"mbp-{levels}"
 
 
 #: Default contract cycle: quarterly (equity index, FX, rates).
@@ -194,7 +229,12 @@ class MarketDataFetcher:
       - ``fetch_calendar_spread_contract_specification(front_month, product)``
 
     The private fetch/definition methods are the implementation surface
-    for Issues #6/#7 and currently raise ``NotImplementedError``.
+    for Issues #6/#7. As of this change, the #6 methods
+    (``_fetch_single_instrument``, ``_fetch_single_instrument_trades``,
+    ``_trading_days``) are implemented; the #7 methods
+    (``_fetch_definitions``, ``_build_contract_spec``) and
+    ``next_contract_month`` still raise ``NotImplementedError`` pending the
+    contract mapping file.
     """
 
     def __init__(
@@ -206,7 +246,13 @@ class MarketDataFetcher:
         """``levels`` defaults to 1 (MBP-1, top of book): sufficient for the
         P&L simulation (#9) and far cheaper to fetch and hold in memory than
         full depth. Pass a higher value only where depth is actually needed
-        (e.g. the implied-vs-real book comparison, #15)."""
+        (e.g. the implied-vs-real book comparison, #15).
+
+        Raises ``ValueError`` immediately if ``levels`` isn't a depth
+        Databento actually supports (1 or 10) — fail at construction, not
+        on the first fetch call.
+        """
+        _schema_for_levels(levels)  # validates; raises early if invalid
         self._client = client
         self._dataset = dataset
         self._levels = levels
@@ -238,6 +284,12 @@ class MarketDataFetcher:
         separately and returned on their raw event timestamps — no
         cross-instrument alignment is performed (consumers use as-of
         lookups where needed, e.g. book state at a trade's timestamp).
+
+        NOTE: still raises NotImplementedError via ``_resolve_symbols`` ->
+        ``next_contract_month``, which is Issue #7 scope (depends on the
+        contract mapping file). The #6 fetch methods this calls into
+        (``_fetch_single_instrument`` etc.) are implemented and independently
+        testable with an already-resolved symbol in the meantime.
         """
         front_symbol, back_symbol, spread_symbol = self._resolve_symbols(
             front_month, product, cycle
@@ -350,7 +402,29 @@ class MarketDataFetcher:
         Returns a book frame (see module docstring): ``ts_event`` UTC index,
         ``bid/ask _px/_sz`` columns for ``self._levels`` levels.
         """
-        raise NotImplementedError  # Issue #6
+        start = _normalize_time(time_start)
+        end = _normalize_time(time_end)
+        schema = _schema_for_levels(self._levels)
+        cols = book_columns(self._levels)
+
+        dbn = self._client.timeseries.get_range(
+            dataset=self._dataset,
+            schema=schema,
+            symbols=[symbol],
+            start=start.isoformat(),
+            end=end.isoformat(),
+        )
+        df = dbn.to_df()
+
+        if df.empty:
+            empty = pd.DataFrame(columns=cols)
+            empty.index = pd.DatetimeIndex([], tz="UTC", name=BOOK_INDEX_NAME)
+            return empty
+
+        df = df[cols].copy()
+        df.index = _ensure_utc_index(df.index)
+        df.index.name = BOOK_INDEX_NAME
+        return df.sort_index()
 
     def _fetch_single_instrument_trades(
         self,
@@ -363,19 +437,62 @@ class MarketDataFetcher:
         Returns a trade frame (see module docstring): ``ts_event`` UTC index,
         ``price``, ``size``, ``side`` columns, in ascending time order.
         """
-        raise NotImplementedError  # Issue #6
+        start = _normalize_time(time_start)
+        end = _normalize_time(time_end)
+
+        dbn = self._client.timeseries.get_range(
+            dataset=self._dataset,
+            schema="trades",
+            symbols=[symbol],
+            start=start.isoformat(),
+            end=end.isoformat(),
+        )
+        df = dbn.to_df()
+
+        if df.empty:
+            empty = pd.DataFrame(columns=TRADE_COLUMNS)
+            empty.index = pd.DatetimeIndex([], tz="UTC", name=BOOK_INDEX_NAME)
+            return empty
+
+        df = df[TRADE_COLUMNS].copy()
+        df.index = _ensure_utc_index(df.index)
+        df.index.name = BOOK_INDEX_NAME
+        return df.sort_index()
 
     def _trading_days(
         self,
         time_start: TimeLike,
         time_end: TimeLike,
     ) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
-        """Split a time window into per-trading-day (start, end) sub-windows.
+        """Split a time window into per-day (start, end) sub-windows
 
-        Must respect the CME trading calendar (skip weekends/holidays) and
-        clip the first/last day to ``time_start``/``time_end``.
+        Does NOT account for CME holidays — on an actual exchange holiday
+        this will still yield a window for that day, and the resulting fetch
+        will just come back empty (handled the same way as any other
+        thin/quiet period — see `_fetch_single_instrument`'s empty-result
+        handling). That's a deliberate simplification: this method only
+        needs to bound memory usage ("one day of data at a time" per
+        `iter_calendar_spread_data`'s docstring), not model real CME trading
+        sessions — so it doesn't pull in a market-calendar dependency to
+        shave off a handful of wasted, harmless empty fetches per year.
         """
-        raise NotImplementedError  # Issue #6
+        start = _normalize_time(time_start)
+        end = _normalize_time(time_end)
+        if start >= end:
+            raise ValueError(f"time_start ({start}) must be before time_end ({end})")
+
+        windows: list[tuple[pd.Timestamp, pd.Timestamp]] = []
+        day = pd.Timestamp(start.date(), tz="UTC")
+        while day < end:
+            next_day = day + pd.Timedelta(days=1)
+            if day.weekday() < 5:  # Monday=0 .. Friday=4; skip Saturday/Sunday
+                day_start = max(start, day)
+                day_end = min(end, next_day)
+                if day_start < day_end:
+                    windows.append((day_start, day_end))
+            day = next_day
+
+        return windows
 
     def _fetch_definitions(
         self,
@@ -395,3 +512,11 @@ class MarketDataFetcher:
     ) -> CalendarSpreadContractSpec:
         """Map raw definitions (+ static JSON mapping file) to a ``CalendarSpreadContractSpec``."""
         raise NotImplementedError  # Issue #7
+
+
+def _ensure_utc_index(index: pd.DatetimeIndex) -> pd.DatetimeIndex:
+    """Normalize a DataFrame's DatetimeIndex to tz-aware UTC, whether
+    Databento handed it back naive or already tz-aware."""
+    if index.tz is None:
+        return index.tz_localize("UTC")
+    return index.tz_convert("UTC")

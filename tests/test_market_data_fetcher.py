@@ -1,17 +1,20 @@
-"""Unit tests for MarketDataFetcher (skeleton, Issues #6/#7).
+"""Unit tests for MarketDataFetcher (Issue #6 implemented, Issue #7 pending).
 
-The private fetch methods are not implemented yet, so:
 - pure helpers (symbol parsing, spread symbol building, schema, spec math)
   are tested directly;
 - the public methods are tested as *composition* with mocked privates,
-  pinning down the call contract before implementation;
-- the intended behavior of ``next_contract_month`` is written as xfail tests
-  that will start passing once it is implemented (remove the marks then).
+  pinning down the call contract independent of implementation;
+- Issue #6's methods (_fetch_single_instrument, _fetch_single_instrument_trades,
+  _trading_days) now have real coverage against a mocked Databento client —
+  see the "Issue #6 — implemented fetch methods" section below;
+- the intended behavior of ``next_contract_month`` (and everything that
+  depends on it: _fetch_definitions, _build_contract_spec) is still written
+  as xfail tests pending Issue #7; remove the marks once implemented.
 """
 
 import sys
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pandas as pd
 import pytest
@@ -25,6 +28,7 @@ from market_data_fetcher import (
     CalendarSpreadContractSpec,
     CalendarSpreadData,
     MarketDataFetcher,
+    _normalize_time,
     book_columns,
     next_contract_month,
     split_symbol,
@@ -34,7 +38,13 @@ from market_data_fetcher import (
 # Fixtures
 # --------------------------------------------------------------------- #
 
-LEVELS = 2  # small books are enough for unit tests
+LEVELS = 2  # small books are enough for unit tests — NOTE: this is a book
+# *shape* convenience for test data only (make_book/book_columns are pure
+# functions, independent of any MarketDataFetcher instance). It is NOT a
+# valid `levels` value to construct MarketDataFetcher with: Databento only
+# exposes mbp-1 and mbp-10 as real schemas, and __init__ validates against
+# exactly that set (Issue #6). See test_init_rejects_non_databento_levels
+# below. The `fetcher` fixture therefore uses levels=1, not LEVELS.
 
 
 def make_book(timestamps, bid_px, ask_px, bid_sz=10.0, ask_sz=10.0, levels=LEVELS):
@@ -99,7 +109,22 @@ def es_spec():
 
 @pytest.fixture
 def fetcher():
-    return MarketDataFetcher(client=None, levels=LEVELS)
+    # levels=1, not LEVELS(=2) — see the LEVELS comment above. This fixture
+    # is used by composition tests that mock out the private fetch methods
+    # entirely, so the specific valid level chosen here doesn't affect them.
+    return MarketDataFetcher(client=None, levels=1)
+
+
+def _client_returning(df: pd.DataFrame) -> MagicMock:
+    """A mocked Databento Historical client whose timeseries.get_range(...).to_df()
+    returns a fixed DataFrame, for testing the Issue #6 fetch methods directly
+    (as opposed to the composition tests below, which mock the fetch methods
+    themselves and never touch a client)."""
+    client = MagicMock()
+    result = MagicMock()
+    result.to_df.return_value = df
+    client.timeseries.get_range.return_value = result
+    return client
 
 
 # --------------------------------------------------------------------- #
@@ -331,17 +356,131 @@ def test_fetch_contract_specification_composes_privates(fetcher, es_spec):
 
 
 # --------------------------------------------------------------------- #
-# Not-yet-implemented surface (Issues #6/#7)
+# Issue #6 — implemented fetch methods (real behavior, mocked Databento client)
+#
+# These call the actual private methods (not mocked out, unlike the
+# composition tests above) against a MagicMock client standing in for
+# databento.Historical, so the real fetch/normalization/schema logic gets
+# exercised rather than just the call contract.
 # --------------------------------------------------------------------- #
 
-def test_unimplemented_privates_raise(fetcher, es_books):
+def test_init_rejects_non_databento_levels():
+    # Databento only exposes mbp-1 and mbp-10 — LEVELS(=2), used above purely
+    # for compact test book shapes, is not a real schema and must be rejected
+    # at construction rather than failing confusingly on first fetch.
+    with pytest.raises(ValueError, match="mbp-1 and mbp-10"):
+        MarketDataFetcher(client=None, levels=LEVELS)
+
+
+def test_init_accepts_valid_levels():
+    MarketDataFetcher(client=None, levels=1)
+    MarketDataFetcher(client=None, levels=10)
+
+
+def test_fetch_single_instrument_uses_mbp1_schema_for_levels_1():
+    raw = make_book(["2026-06-10T16:00:00Z", "2026-06-10T16:00:01Z"],
+                     bid_px=[7340.00, 7340.25], ask_px=[7340.25, 7340.50], levels=1)
+    client = _client_returning(raw)
+    f = MarketDataFetcher(client=client, levels=1)
+
+    result = f._fetch_single_instrument("ESM6", "2026-06-10T16:00:00Z", "2026-06-10T16:00:02Z")
+
+    _, kwargs = client.timeseries.get_range.call_args
+    assert kwargs["schema"] == "mbp-1"
+    assert kwargs["symbols"] == ["ESM6"]
+    assert list(result.columns) == book_columns(1)
+    assert result.index.name == BOOK_INDEX_NAME
+    assert str(result.index.tz) == "UTC"
+    assert result.index.is_monotonic_increasing
+
+
+def test_fetch_single_instrument_uses_mbp10_schema_for_levels_10():
+    raw = make_book(["2026-06-10T16:00:00Z"], bid_px=[7340.00], ask_px=[7340.25], levels=10)
+    client = _client_returning(raw)
+    f = MarketDataFetcher(client=client, levels=10)
+
+    f._fetch_single_instrument("ESM6", "2026-06-10T16:00:00Z", "2026-06-10T16:00:01Z")
+
+    _, kwargs = client.timeseries.get_range.call_args
+    assert kwargs["schema"] == "mbp-10"
+
+
+def test_fetch_single_instrument_empty_result_keeps_schema():
+    empty = pd.DataFrame(columns=book_columns(1))
+    client = _client_returning(empty)
+    f = MarketDataFetcher(client=client, levels=1)
+
+    result = f._fetch_single_instrument("ESM6", "2026-06-10T16:00:00Z", "2026-06-10T16:00:01Z")
+
+    assert result.empty
+    assert list(result.columns) == book_columns(1)
+    assert str(result.index.tz) == "UTC"
+    assert result.index.name == BOOK_INDEX_NAME
+
+
+def test_fetch_single_instrument_normalizes_naive_databento_index_to_utc():
+    # Databento's to_df() output isn't guaranteed tz-aware; the fetcher must
+    # not silently misinterpret a naive index as some other zone.
+    idx = pd.DatetimeIndex(["2026-06-10T16:00:00"], name=BOOK_INDEX_NAME)  # naive
+    raw = pd.DataFrame({c: [1.0] for c in book_columns(1)}, index=idx)
+    client = _client_returning(raw)
+    f = MarketDataFetcher(client=client, levels=1)
+
+    result = f._fetch_single_instrument("ESM6", "2026-06-10T16:00:00Z", "2026-06-10T16:00:01Z")
+    assert str(result.index.tz) == "UTC"
+
+
+def test_fetch_single_instrument_trades_schema_and_columns():
+    trades = make_trades(["2026-06-10T16:00:00.5Z"], [7340.00], [5.0], ["A"])
+    client = _client_returning(trades)
+    f = MarketDataFetcher(client=client, levels=1)
+
+    result = f._fetch_single_instrument_trades(
+        "ESM6", "2026-06-10T16:00:00Z", "2026-06-10T16:00:01Z"
+    )
+
+    _, kwargs = client.timeseries.get_range.call_args
+    assert kwargs["schema"] == "trades"
+    assert list(result.columns) == TRADE_COLUMNS
+    assert result["price"].iloc[0] == 7340.00
+
+
+def test_trading_days_clips_first_and_last_session():
+    f = MarketDataFetcher(client=MagicMock(), levels=1)
+    # Mon 2026-06-08 through Wed 2026-06-10 — 3 sessions, no holiday in range
+    windows = f._trading_days("2026-06-08T18:00:00Z", "2026-06-10T12:00:00Z")
+
+    assert len(windows) == 3
+    first_start, _ = windows[0]
+    _, last_end = windows[-1]
+    assert first_start == _normalize_time("2026-06-08T18:00:00Z")
+    assert last_end == _normalize_time("2026-06-10T12:00:00Z")
+    for s, e in windows:
+        assert s < e
+        assert s.tzinfo is not None and e.tzinfo is not None
+
+
+def test_trading_days_skips_weekend():
+    f = MarketDataFetcher(client=MagicMock(), levels=1)
+    windows = f._trading_days("2026-06-05T00:00:00Z", "2026-06-08T23:59:59Z")
+    session_dates = {s.date() for s, _ in windows}
+    assert pd.Timestamp("2026-06-06").date() not in session_dates  # Saturday
+
+
+def test_trading_days_raises_on_inverted_range():
+    f = MarketDataFetcher(client=MagicMock(), levels=1)
+    with pytest.raises(ValueError):
+        f._trading_days("2026-06-10T00:00:00Z", "2026-06-09T00:00:00Z")
+
+
+# --------------------------------------------------------------------- #
+# Remaining not-yet-implemented surface (Issue #7 only, now that #6 is done)
+# --------------------------------------------------------------------- #
+
+def test_issue_7_privates_still_unimplemented(fetcher):
     with pytest.raises(NotImplementedError):
         next_contract_month("M6")
     with pytest.raises(NotImplementedError):
-        fetcher._fetch_single_instrument("ESM6", "t0", "t1")
-    with pytest.raises(NotImplementedError):
-        fetcher._fetch_single_instrument_trades("ESM6", "t0", "t1")
-    with pytest.raises(NotImplementedError):
-        fetcher._trading_days("t0", "t1")
-    with pytest.raises(NotImplementedError):
         fetcher._fetch_definitions("ESM6", "ESU6", "ESM6-ESU6")
+    with pytest.raises(NotImplementedError):
+        fetcher._build_contract_spec("ESM6", "ESU6", "ESM6-ESU6", pd.DataFrame())

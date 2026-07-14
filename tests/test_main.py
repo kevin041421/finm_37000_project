@@ -9,4 +9,4 @@ from main import main
 def test_main_runs_without_error(capsys):
     main()
     captured = capsys.readouterr()
-    assert "Hello" in captured.out
+    assert "Leg definitions (ESM6, ESU6)" in captured.out
