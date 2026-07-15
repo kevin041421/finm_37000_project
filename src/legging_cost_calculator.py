@@ -42,29 +42,29 @@ class LeggingCostCalculator:
 
         if trade_side == 'A':
             # Aggressor hits the Spread Bid -> Market Maker is passively LONG the spread.
-            # To flatten, MM must synthetically SELL the spread: Sell Back (hit bid), Buy Front (pay ask).
-            synthetic_trade = front_ask - back_bid
+            # To flatten, MM must synthetically SELL the spread: Sell Front (hit bid), Buy Back (lift ask).
+            implied_bid = front_bid - back_ask
             
             # Convert points to dollar value using the spec's point_value fields
-            synthetic_trade_usd = synthetic_trade * self.spec.outright_point_value
+            implied_bid_usd = implied_bid * self.spec.outright_point_value
             spread_bid_usd = spread_bid * self.spec.spread_point_value
             
             # If there's a cost incurred through the hedge, cost_usd is positive.
-            # Given the Market Maker is passively long the spread, spread_bid_usd is a cost for Market Maker and thus the sign before spread_bid_usd is positive.
-            cost_usd = synthetic_trade_usd + spread_bid_usd
+            # Passively LONG the spread is a cost while SELL the spread to hedge is a benefit.
+            cost_usd = spread_bid_usd - implied_bid_usd
 
         elif trade_side == 'B':
             # Aggressor hits the Spread Ask -> Market Maker is passively SHORT the spread.
-            # To flatten, MM must synthetically LONG the spread: Buy Back (pay ask), Sell Front (hit bid).
-            synthetic_trade = back_ask - front_bid
+            # To flatten, MM must synthetically LONG the spread: Buy Front (lift ask), Sell Back (hit bid).
+            implied_ask = front_ask - back_bid
             
             # Convert points to dollar value using the spec's point_value fields
-            synthetic_trade_usd = synthetic_trade * self.spec.outright_point_value
+            implied_ask_usd = implied_ask * self.spec.outright_point_value
             spread_ask_usd = spread_ask * self.spec.spread_point_value
             
             # If there's a cost incurred through the hedge, cost_usd is positive.
-            # Given the Market Makee is passively SHORT the spread, spread_ask_usd is a benefit for Market Maker ans thus the sign before spreae_bid_usd is negative.
-            cost_usd = synthetic_trade_usd - spread_ask_usd
+            # Passively SHORT the spread is a benefit while LONG the spread to hedge is a cost.
+            cost_usd = implied_ask_usd - spread_ask_usd
             
         else:
             # Unknown trade side
