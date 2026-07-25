@@ -218,3 +218,6 @@ __marimo__/
 .streamlit/secrets.toml
 
 .DS_Store
+
+# Local market-data cache (temp files written by src/demo_print_books.py)
+data_cache/
