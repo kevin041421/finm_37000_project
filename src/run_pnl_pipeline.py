@@ -1,28 +1,15 @@
-"""Run the P&L pipeline end-to-end (Issue #9 demo).
-
-Wires the components together:
-
-    MarketDataFetcher  ->  CalendarSpreadData  ->  replay  ->  PnLCalculator
-
-Uses the TEMP ``HardcodedESFetcher`` (ES Jun/Sep 2026, real Databento data,
-disk-cached) until Issues #6/#7 land. The ``LeggingCostCalculator`` is the
-real #8 logic (adopted locally from PR #21 with the side-convention fix).
-
-Run:
-    uv run src/run_pnl_pipeline.py
-"""
 
 from __future__ import annotations
 
-import databento as db
 import pandas as pd
 
-from demo_print_books import HardcodedESFetcher
+from cached_market_data_fetcher import CachedMarketDataFetcher
 from fee_schedule import get_fee_rates
 from legging_cost_calculator import LeggingCostCalculator
-from market_data_fetcher import CalendarSpreadContractSpec
 from pnl_calculator import PnLCalculator, replay
-from util import get_databento_api_key
+
+PRODUCT = "ES"
+FRONT_MONTH = "M6"
 
 # Two demo sessions: a 60-second window on each day, matching the windows
 # demo_print_books.py already cached to disk — so this runs offline.
@@ -37,31 +24,32 @@ SEED = 42               # fills are random; fix the seed for reproducibility.
                         # Average net_pnl over several seeds for expected P&L.
 FEE_TIER = "non_member" # see fee_schedule.py: non_member | member_firm |
                         # individual_member | fee_waiver
-FEES = get_fee_rates("ES", FEE_TIER)
-CONTRACT_MULTIPLIER = 50.0  # ES: $ per index point
 
-# TEMP hardcoded ES spec until #7's mapping file provides it
-ES_SPEC = CalendarSpreadContractSpec(
-    product_code="ES",
-    front_symbol="ESM6",
-    back_symbol="ESU6",
-    spread_symbol="ESM6-ESU6",
-    outright_tick_size=0.25,
-    spread_tick_size=0.05,
-    contract_multiplier=CONTRACT_MULTIPLIER,
-)
+BOOK_LEVELS = 1         # top of book is all the P&L model reads
 
 
 def main() -> None:
-    client = db.Historical(get_databento_api_key())
-    fetcher = HardcodedESFetcher(client=client, levels=1)
-    cost_calculator = LeggingCostCalculator(ES_SPEC)  # real #8 logic (from PR #21, fixed)
+    fetcher = CachedMarketDataFetcher.from_databento_key(levels=BOOK_LEVELS)
+    spec = fetcher.fetch_calendar_spread_contract_specification(FRONT_MONTH, PRODUCT)
+    contract_multiplier = float(spec.contract_multiplier)
+
+    fees = get_fee_rates(spec.product_code, FEE_TIER)
+
+    print(
+        f"{spec.spread_symbol}  ({spec.front_symbol} / {spec.back_symbol})\n"
+        f"  tick: outright {spec.outright_tick_size}, spread {spec.spread_tick_size}"
+        f"   multiplier: ${contract_multiplier:g}/pt\n"
+        f"  fees ({FEE_TIER}): passive ${fees.passive_fee:.2f}, "
+        f"aggressive ${fees.aggressive_fee:.2f} per contract"
+    )
+
+    cost_calculator = LeggingCostCalculator(spec)
     pnl_calculator = PnLCalculator(
         p=P_QUEUE_HEAD,
         max_position=MAX_POSITION,
-        passive_fee=FEES.passive_fee,
-        aggressive_fee=FEES.aggressive_fee,
-        contract_multiplier=CONTRACT_MULTIPLIER,
+        passive_fee=fees.passive_fee,
+        aggressive_fee=fees.aggressive_fee,
+        contract_multiplier=contract_multiplier,
         seed=SEED,
     )
 
@@ -70,7 +58,7 @@ def main() -> None:
         t1 = t0 + SESSION_LENGTH
         print(f"\n{day} {SESSION_START_UTC}–{t1:%H:%M:%S} UTC  fetching...", flush=True)
 
-        data = fetcher.fetch_calendar_spread_data("M6", "ES", t0, t1)
+        data = fetcher.fetch_calendar_spread_data(FRONT_MONTH, PRODUCT, t0, t1)
         print(
             f"  book events: front={len(data.front)}, back={len(data.back)}, "
             f"spread={len(data.spread)}; spread trades={len(data.spread_trades)}"

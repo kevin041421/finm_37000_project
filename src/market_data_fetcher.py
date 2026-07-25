@@ -556,15 +556,23 @@ class MarketDataFetcher:
         symbol2: str,
         spread_symbol: str,
     ) -> pd.DataFrame:
-        """Fetch Databento instrument definitions for the legs and the spread."""
-        start = (
-            pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=_DEFINITION_LOOKBACK_DAYS)
-        ).isoformat()
+        """Fetch Databento instrument definitions for the legs and the spread.
+
+        Both bounds are day-aligned (midnight UTC). Databento rejects a
+        sub-day-precise ``start`` when ``end`` is omitted — it forward-fills
+        the definition state from ``start`` and can only do that from a day
+        boundary — so ``pd.Timestamp.now()`` cannot be passed through
+        unrounded (422 data_start_too_precise_to_forward_fill).
+        """
+        now = pd.Timestamp.now(tz="UTC")
+        start = (now - pd.Timedelta(days=_DEFINITION_LOOKBACK_DAYS)).normalize()
+        end = now.normalize()
         dbn = self._client.timeseries.get_range(
             dataset=self._dataset,
             schema="definition",
             symbols=[symbol1, symbol2, spread_symbol],
-            start=start,
+            start=start.isoformat(),
+            end=end.isoformat(),
         )
         df = dbn.to_df()
         if df.empty:

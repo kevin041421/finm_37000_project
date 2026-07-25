@@ -166,6 +166,7 @@ class PnLCalculator:
         self._filled_qty = 0.0      # contracts filled passively
         self._hedged_qty = 0.0      # contracts immediately legged out
         self._skipped = 0           # trades with unknown aggressor side
+        self._skipped_no_cost = 0   # trades #8 could not price a hedge for
         self._last_spread_mid: Optional[float] = None
 
     def consume(
@@ -185,6 +186,10 @@ class PnLCalculator:
                 ``name`` is the event timestamp).
             cost: legging cost in dollars per spread contract from the #8
                 calculator, for the contracts hedged at the position cap.
+                ``None`` when #8 cannot price the hedge (unknown aggressor
+                side, or a missing top-of-book level); such trades are
+                recorded and skipped rather than filled, since we cannot
+                bound the cost of the hedge they might force.
         """
         self._transactions.append(
             SpreadTransaction(
@@ -195,12 +200,16 @@ class PnLCalculator:
                 front_snapshot=front_snapshot,
                 back_snapshot=back_snapshot,
                 spread_snapshot=spread_snapshot,
-                cost=float(cost),
+                cost=float("nan") if cost is None else float(cost),
             )
         )
-        self._last_spread_mid = (
-            spread_snapshot["bid_px_00"] + spread_snapshot["ask_px_00"]
+        spread_mid = (
+            float(spread_snapshot["bid_px_00"]) + float(spread_snapshot["ask_px_00"])
         ) / 2.0
+        if not pd.isna(spread_mid):
+            # Keep the last *valid* mark: a one-sided spread book (NaN level)
+            # must not wipe out the mark used to value the residual position.
+            self._last_spread_mid = spread_mid
 
         side = str(trade["side"])
         if side == "B":
@@ -210,6 +219,14 @@ class PnLCalculator:
         else:
             self._skipped += 1
             return
+
+        if cost is None or pd.isna(cost):
+            # #8 could not price the hedge for this trade (missing top of
+            # book). Taking the fill would leave the position cap unpriced,
+            # so stand aside rather than book an unbounded hedge.
+            self._skipped_no_cost += 1
+            return
+        cost = float(cost)
 
         # Bernoulli fill: the trade fills us in full with probability p
         if self._rng.random() >= self.p:
@@ -264,6 +281,7 @@ class PnLCalculator:
             {
                 "transactions": float(self.transaction_count),
                 "skipped_unknown_side": float(self._skipped),
+                "skipped_no_hedge_price": float(self._skipped_no_cost),
                 "filled_contracts": self._filled_qty,
                 "hedged_contracts": self._hedged_qty,
                 "final_position": self._position,
