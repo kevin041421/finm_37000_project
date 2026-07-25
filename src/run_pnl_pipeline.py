@@ -15,7 +15,7 @@ FRONT_MONTH = "M6"
 # demo_print_books.py already cached to disk — so this runs offline.
 DAYS = ["2026-06-09", "2026-06-10"]
 SESSION_START_UTC = "16:00:00"  # 10:00 AM CT, the README snapshot hour
-SESSION_LENGTH = pd.Timedelta(seconds=60)
+SESSION_LENGTH = pd.Timedelta(seconds=300)
 
 # Model parameters (Issue #9) — tune these
 P_QUEUE_HEAD = 0.5      # probability a trade fills us in full (queue head)

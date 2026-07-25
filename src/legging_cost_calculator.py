@@ -13,6 +13,21 @@ class LeggingCostCalculator:
     contract multiplier needed to turn points into dollars, and it is produced
     by ``MarketDataFetcher.fetch_calendar_spread_contract_specification``.
     Constructing one here from four strings alone is not possible.
+
+    Sign convention
+    ---------------
+    CME quotes the equity-index calendar spread as BACK minus FRONT, so the
+    implied leg differential must be built the same way. Verified against
+    ESM6-ESU6 on 2026-06-09 16:00 UTC: front 7312.25/7312.50, back
+    7372.75/7373.25, spread quoted 60.75/60.80 — i.e. back - front = +61,
+    not front - back = -61.
+
+    Getting this backwards does not merely flip the sign of the answer: the
+    implied and quoted legs then have opposite signs, so differencing them
+    yields roughly *twice the spread level* (~120 points, ~$6,000) instead of
+    a residual of a tick or two. Any cost far above a few ticks means this
+    convention has drifted out of line with the venue's quote — check it
+    before trusting the P&L.
     """
 
     def __init__(self, spec: CalendarSpreadContractSpec):
@@ -55,10 +70,12 @@ class LeggingCostCalculator:
 
         if trade_side == "A":
             # Aggressor hits the Spread Bid -> Market Maker is passively LONG the spread.
-            # To flatten, MM must synthetically SELL the spread: Sell Front (hit bid), Buy Back (lift ask).
-            if pd.isna(front_bid) or pd.isna(back_ask) or pd.isna(spread_bid):
+            # Long the spread = long the back leg, short the front leg (see the
+            # sign convention above). To flatten, MM synthetically SELLS the
+            # spread: Sell Back (hit its bid), Buy Front (lift its ask).
+            if pd.isna(back_bid) or pd.isna(front_ask) or pd.isna(spread_bid):
                 return None
-            implied_bid = float(front_bid) - float(back_ask)
+            implied_bid = float(back_bid) - float(front_ask)
 
             # Convert points to dollar value using the spec's multiplier
             implied_bid_usd = implied_bid * self.outright_point_value
@@ -69,11 +86,12 @@ class LeggingCostCalculator:
             cost_usd = spread_bid_usd - implied_bid_usd
 
         elif trade_side == "B":
-            # Aggressor hits the Spread Ask -> Market Maker is passively SHORT the spread.
-            # To flatten, MM must synthetically LONG the spread: Buy Front (lift ask), Sell Back (hit bid).
-            if pd.isna(front_ask) or pd.isna(back_bid) or pd.isna(spread_ask):
+            # Aggressor lifts the Spread Ask -> Market Maker is passively SHORT the spread.
+            # To flatten, MM synthetically BUYS the spread: Buy Back (lift its
+            # ask), Sell Front (hit its bid).
+            if pd.isna(back_ask) or pd.isna(front_bid) or pd.isna(spread_ask):
                 return None
-            implied_ask = float(front_ask) - float(back_bid)
+            implied_ask = float(back_ask) - float(front_bid)
 
             # Convert points to dollar value using the spec's multiplier
             implied_ask_usd = implied_ask * self.outright_point_value
