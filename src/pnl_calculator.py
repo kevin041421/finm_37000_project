@@ -279,6 +279,11 @@ class PnLCalculator:
         net_pnl = self._cash + position_mark - self._passive_fees - self._hedge_costs
         return pd.Series(
             {
+                # Model parameters, echoed so a sample is self-describing: a
+                # parameter sweep (Issue #10) stacks many of these Series into
+                # one frame, where the rows are otherwise indistinguishable.
+                "p_queue_head": float(self.p),
+                "max_position": float(self.max_position),
                 "transactions": float(self.transaction_count),
                 "skipped_unknown_side": float(self._skipped),
                 "skipped_no_hedge_price": float(self._skipped_no_cost),
@@ -315,26 +320,32 @@ def _merged_events(data: CalendarSpreadData):
     return events
 
 
-def replay(
+def extract_transactions(
     data: CalendarSpreadData,
     cost_calculator: LeggingCostCalculator,
-    pnl_calculator: PnLCalculator,
-) -> int:
-    """Drive one ``CalendarSpreadData`` through the P&L pipeline.
+) -> list[tuple[pd.Series, pd.Series, pd.Series, pd.Series, Optional[float]]]:
+    """Resolve one ``CalendarSpreadData`` into ready-to-consume transactions.
 
-    Event-driven replay: all book updates and spread trades are merged into
-    one time-ordered stream and walked once (O(n + m)). Book updates refresh
-    the cached "current state" per instrument; each spread trade triggers a
-    legging-cost query (#8) and is fed to ``pnl_calculator.consume`` with
-    the three cached snapshots. Trades that occur before all three books
-    have a state are skipped.
+    Event-driven walk: all book updates and spread trades are merged into one
+    time-ordered stream and traversed once (O(n + m)). Book updates refresh
+    the cached "current state" per instrument; each spread trade is paired
+    with the three cached snapshots and its legging cost (#8). Trades
+    occurring before all three books have a state are dropped.
 
-    Returns the number of transactions consumed.
+    Returns a list of ``(front, back, spread, trade, cost)`` tuples, the exact
+    argument list of ``PnLCalculator.consume``.
+
+    Separated from ``replay`` because nothing here depends on the P&L model's
+    parameters — the books, the trades and the legging costs are properties of
+    the market data alone. A parameter sweep (Issue #10) runs thousands of
+    P&L configurations over the same session, so it extracts once and replays
+    the result many times, instead of re-walking ~60k book events per
+    configuration.
     """
     books: dict[str, Optional[pd.Series]] = {"front": None, "back": None, "spread": None}
 
-    consumed = 0
-    for ts, _priority, kind, payload in _merged_events(data):
+    transactions = []
+    for _ts, _priority, kind, payload in _merged_events(data):
         if kind != "trade":
             books[kind] = payload  # update cached book state
             continue
@@ -345,8 +356,33 @@ def replay(
         cost = cost_calculator.get_cost(
             books["front"], books["back"], books["spread"], str(payload["side"])
         )
-        pnl_calculator.consume(
-            books["front"], books["back"], books["spread"], payload, cost
+        transactions.append(
+            (books["front"], books["back"], books["spread"], payload, cost)
         )
-        consumed += 1
-    return consumed
+    return transactions
+
+
+def consume_all(
+    transactions: list[tuple[pd.Series, pd.Series, pd.Series, pd.Series, Optional[float]]],
+    pnl_calculator: PnLCalculator,
+) -> int:
+    """Feed pre-extracted transactions to a calculator. Returns the count."""
+    for front, back, spread, trade, cost in transactions:
+        pnl_calculator.consume(front, back, spread, trade, cost)
+    return len(transactions)
+
+
+def replay(
+    data: CalendarSpreadData,
+    cost_calculator: LeggingCostCalculator,
+    pnl_calculator: PnLCalculator,
+) -> int:
+    """Drive one ``CalendarSpreadData`` through the P&L pipeline.
+
+    Convenience wrapper: ``extract_transactions`` followed by ``consume_all``.
+    Use those two directly when replaying the same session under many model
+    configurations.
+
+    Returns the number of transactions consumed.
+    """
+    return consume_all(extract_transactions(data, cost_calculator), pnl_calculator)

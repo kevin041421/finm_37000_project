@@ -221,3 +221,4 @@ __marimo__/
 
 # Local market-data cache (temp files written by src/demo_print_books.py)
 data_cache/
+results/
